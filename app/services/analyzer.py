@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from openai import AsyncOpenAI
@@ -62,11 +63,14 @@ Return ONLY valid JSON."""
 
 async def analyze_all_messages(responses: list[dict], target_brand: str, run_id: str) -> list[dict]:
     """Analyze a batch of responses and return all mention records."""
-    all_mentions = []
-    for resp in responses:
-        mentions = await analyze_message(resp, target_brand, run_id)
-        all_mentions.extend(mentions)
-    return all_mentions
+    sem = asyncio.Semaphore(5)
+
+    async def _analyze_one(resp):
+        async with sem:
+            return await analyze_message(resp, target_brand, run_id)
+
+    results = await asyncio.gather(*[_analyze_one(r) for r in responses])
+    return [m for mentions in results for m in mentions]
 
 
 def aggregate_competitor_appearances(run_id: str) -> list[dict]:

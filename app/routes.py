@@ -1,3 +1,5 @@
+import asyncio
+import time
 from datetime import date, datetime
 
 from fastapi import APIRouter, HTTPException
@@ -25,7 +27,7 @@ router = APIRouter()
 
 @router.post("/api/setup", response_model=SetupResponse)
 async def setup(req: SetupRequest):
-    """One-shot: create brand from website + generate 5 prompts."""
+    """One-shot: create brand from website + generate 50 prompts."""
     try:
         brand_data = await setup_brand(req.website, country=req.country)
     except Exception as e:
@@ -109,29 +111,39 @@ async def simulate():
     }).execute().data[0]
 
     try:
-        all_responses = []
-
         # Build location dict for geo-targeted web search
         user_location = None
         if brand.get("country"):
             user_location = {"type": "approximate", "country": brand["country"]}
 
-        for prompt in prompts:
-            response_row = await run_conversation(
-                run_id=run["id"],
-                prompt_id=prompt["id"],
-                question_text=prompt["question_text"],
-                user_location=user_location,
-            )
-            all_responses.append(response_row)
+        sem = asyncio.Semaphore(5)
+
+        async def _run_one(i, prompt):
+            t0 = time.perf_counter()
+            async with sem:
+                result = await run_conversation(
+                    run_id=run["id"],
+                    prompt_id=prompt["id"],
+                    question_text=prompt["question_text"],
+                    user_location=user_location,
+                )
+                print(f"[conversation {i+1}/{len(prompts)}] done in {time.perf_counter() - t0:.1f}s")
+                return result
+
+        t_conv = time.perf_counter()
+        all_responses = await asyncio.gather(*[_run_one(i, p) for i, p in enumerate(prompts)])
+        print(f"[simulate] all {len(all_responses)} conversations done in {time.perf_counter() - t_conv:.1f}s")
 
         # Analyze all responses for brand mentions
+        t_analysis = time.perf_counter()
         all_mentions = await analyze_all_messages(
             all_responses, brand["name"], run["id"]
         )
+        print(f"[simulate] all {len(all_responses)} analyses done in {time.perf_counter() - t_analysis:.1f}s")
 
         # Aggregate competitor appearances
         aggregate_competitor_appearances(run["id"])
+        print(f"[simulate] total wall time: {time.perf_counter() - t_conv:.1f}s")
 
         # Mark run as completed
         supabase.table("daily_runs").update({

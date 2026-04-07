@@ -25,7 +25,7 @@ COUNTRY_NAMES = {"IN": "India", "DE": "Germany", "US": "United States"}
 
 
 async def analyze_brand_and_generate_prompts(website: str, country: str | None = None) -> dict:
-    """Analyze a brand website and return brand info + 5 prompts.
+    """Analyze a brand website and return brand info + 50 prompts.
 
     Returns dict with keys: name, description, category, prompts
     """
@@ -44,18 +44,24 @@ Based on this website, return a JSON object with:
 1. "name": the brand name
 2. "description": a 1-2 sentence description of what they sell/do
 3. "category": the product/service category (e.g., "laptops", "running shoes", "project management software")
-4. "prompts": an array of exactly 5 detailed buyer questions that someone would type into ChatGPT when seriously researching a purchase in this category. These questions should:
+4. "prompts": an array of exactly 50 detailed buyer questions that someone would type into ChatGPT when seriously researching a purchase in this category. These questions should:
    - NOT mention the brand name at all
    - Be specific and detailed enough that an AI assistant would naturally respond with brand names, product recommendations, and comparisons
    - Explicitly ask for brand recommendations, top picks, or head-to-head comparisons — vague questions like "what are the best dresses?" are useless because they don't elicit brand names
    - Each question should be 1-2 sentences long and include context about the buyer's needs, budget, or use case
-   - Cover these 5 angles (one question per angle):
+   - Cover these 10 angles (exactly 5 questions per angle, each with a different specific use case or buyer persona):
      1. "top_picks": Ask for the top 5-10 brands/products for a specific use case (e.g., "What are the top 5 laptop brands for video editing under $1500, and what makes each one stand out?")
      2. "budget": Ask for affordable brand recommendations with a price constraint (e.g., "Which running shoe brands offer the best value under $100 for someone training for their first marathon?")
      3. "comparison": Ask for a direct comparison between types/categories of products (e.g., "How do ultrabook laptops compare to gaming laptops for a computer science student who also games on weekends?")
      4. "specific_need": Ask about brands that solve a very specific problem (e.g., "I have flat feet and need running shoes with strong arch support — which brands should I look at and why?")
      5. "switching": Ask from the perspective of someone considering switching from a competitor or upgrading (e.g., "I've been using budget running shoes but want to upgrade to something more serious — what brands should I consider and what's the difference?")
+     6. "professional": Ask from a professional or business buyer perspective (e.g., "What laptop brands do software development teams typically standardize on, and what are the pros and cons of each?")
+     7. "beginner": Ask as a complete beginner entering the category (e.g., "I've never bought running shoes for serious training before — what brands should a beginner look at and what should I know?")
+     8. "durability": Ask about longevity, reliability, or build quality (e.g., "Which laptop brands have the best track record for lasting 5+ years without major issues?")
+     9. "trending": Ask about what's currently popular or gaining momentum (e.g., "What running shoe brands are trending right now and why are people switching to them?")
+     10. "alternative": Ask for alternatives to a well-known category leader without naming the brand (e.g., "What are some lesser-known laptop brands that rival the big names in performance but cost less?")
    - Each question should have a "question_text" and a "category_context" matching the angle name above
+   - Make every question distinct — vary the buyer persona, budget range, use case, and specifics so no two questions feel like rephrases of each other
 """
 
     if country and country != "US":
