@@ -1,11 +1,12 @@
 import asyncio
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException
 
 from app.database import supabase
 from app.models import (
+    BackfillResponse,
     BrandResponse,
     ConversationsResponse,
     ConversationThread,
@@ -18,7 +19,7 @@ from app.models import (
     SimulateResponse,
 )
 from app.services.analyzer import analyze_all_messages, aggregate_competitor_appearances
-from app.services.conversation import run_conversation
+from app.services.conversation import run_conversation, run_conversation_historical
 from app.services.scoring import get_dashboard
 from app.services.prompt_generator import setup_brand
 
@@ -80,16 +81,93 @@ async def get_brand():
     )
 
 
+async def _run_simulation(brand: dict, prompts: list[dict],
+                          user_location: dict | None,
+                          run_date: date,
+                          historical: bool = False) -> RunSummary:
+    """Core simulation logic shared by simulate() and backfill().
+
+    Creates a daily_run, runs all conversations (parallelised with Semaphore(5)),
+    analyses responses, aggregates competitors, and returns a RunSummary.
+    """
+    run_date_str = run_date.isoformat()
+    run = supabase.table("daily_runs").insert({
+        "brand_id": brand["id"],
+        "run_date": run_date_str,
+        "status": "pending",
+        "started_at": datetime.utcnow().isoformat(),
+    }).execute().data[0]
+
+    try:
+        sem = asyncio.Semaphore(5)
+
+        async def _run_one(i, prompt):
+            t0 = time.perf_counter()
+            async with sem:
+                if historical:
+                    result = await run_conversation_historical(
+                        run_id=run["id"],
+                        prompt_id=prompt["id"],
+                        question_text=prompt["question_text"],
+                        end_date=run_date_str,
+                        user_location=user_location,
+                    )
+                else:
+                    result = await run_conversation(
+                        run_id=run["id"],
+                        prompt_id=prompt["id"],
+                        question_text=prompt["question_text"],
+                        user_location=user_location,
+                    )
+                print(f"[{run_date_str} conversation {i+1}/{len(prompts)}] done in {time.perf_counter() - t0:.1f}s")
+                return result
+
+        t_conv = time.perf_counter()
+        all_responses = await asyncio.gather(*[_run_one(i, p) for i, p in enumerate(prompts)])
+        print(f"[{run_date_str}] all {len(all_responses)} conversations done in {time.perf_counter() - t_conv:.1f}s")
+
+        t_analysis = time.perf_counter()
+        all_mentions = await analyze_all_messages(
+            all_responses, brand["name"], run["id"]
+        )
+        print(f"[{run_date_str}] all {len(all_responses)} analyses done in {time.perf_counter() - t_analysis:.1f}s")
+
+        aggregate_competitor_appearances(run["id"])
+        print(f"[{run_date_str}] total wall time: {time.perf_counter() - t_conv:.1f}s")
+
+        supabase.table("daily_runs").update({
+            "status": "completed",
+            "completed_at": datetime.utcnow().isoformat(),
+        }).eq("id", run["id"]).execute()
+
+        target_mentions = [m for m in all_mentions if m.get("is_target_brand")]
+
+        return RunSummary(
+            run_id=run["id"],
+            run_date=run_date_str,
+            status="completed",
+            total_messages_analyzed=len(all_responses),
+            total_mentions=len(all_mentions),
+            target_brand_mentions=len(target_mentions),
+        )
+
+    except Exception as e:
+        supabase.table("daily_runs").update({
+            "status": "failed",
+            "completed_at": datetime.utcnow().isoformat(),
+            "error_message": str(e),
+        }).eq("id", run["id"]).execute()
+        raise
+
+
 @router.post("/api/simulate", response_model=SimulateResponse)
 async def simulate():
     """Run a daily simulation: one question/answer per prompt."""
-    # Get brand
     brands = supabase.table("brand").select("*").execute().data
     if not brands:
         raise HTTPException(status_code=404, detail="No brand configured. POST /api/setup first.")
     brand = brands[0]
 
-    # Get active prompts
     prompts = (
         supabase.table("prompts")
         .select("*")
@@ -101,78 +179,65 @@ async def simulate():
     if not prompts:
         raise HTTPException(status_code=400, detail="No active prompts.")
 
-    # Create daily run
-    today = date.today().isoformat()
-    run = supabase.table("daily_runs").insert({
-        "brand_id": brand["id"],
-        "run_date": today,
-        "status": "pending",
-        "started_at": datetime.utcnow().isoformat(),
-    }).execute().data[0]
+    user_location = None
+    if brand.get("country"):
+        user_location = {"type": "approximate", "country": brand["country"]}
 
     try:
-        # Build location dict for geo-targeted web search
-        user_location = None
-        if brand.get("country"):
-            user_location = {"type": "approximate", "country": brand["country"]}
-
-        sem = asyncio.Semaphore(5)
-
-        async def _run_one(i, prompt):
-            t0 = time.perf_counter()
-            async with sem:
-                result = await run_conversation(
-                    run_id=run["id"],
-                    prompt_id=prompt["id"],
-                    question_text=prompt["question_text"],
-                    user_location=user_location,
-                )
-                print(f"[conversation {i+1}/{len(prompts)}] done in {time.perf_counter() - t0:.1f}s")
-                return result
-
-        t_conv = time.perf_counter()
-        all_responses = await asyncio.gather(*[_run_one(i, p) for i, p in enumerate(prompts)])
-        print(f"[simulate] all {len(all_responses)} conversations done in {time.perf_counter() - t_conv:.1f}s")
-
-        # Analyze all responses for brand mentions
-        t_analysis = time.perf_counter()
-        all_mentions = await analyze_all_messages(
-            all_responses, brand["name"], run["id"]
-        )
-        print(f"[simulate] all {len(all_responses)} analyses done in {time.perf_counter() - t_analysis:.1f}s")
-
-        # Aggregate competitor appearances
-        aggregate_competitor_appearances(run["id"])
-        print(f"[simulate] total wall time: {time.perf_counter() - t_conv:.1f}s")
-
-        # Mark run as completed
-        supabase.table("daily_runs").update({
-            "status": "completed",
-            "completed_at": datetime.utcnow().isoformat(),
-        }).eq("id", run["id"]).execute()
-
-        target_mentions = [m for m in all_mentions if m.get("is_target_brand")]
-
-        return SimulateResponse(
-            run=RunSummary(
-                run_id=run["id"],
-                run_date=today,
-                status="completed",
-                total_messages_analyzed=len(all_responses),
-                total_mentions=len(all_mentions),
-                target_brand_mentions=len(target_mentions),
-            ),
-            message=f"Simulation complete: {len(all_responses)} responses analyzed, {len(target_mentions)} target brand mentions found.",
-        )
-
+        summary = await _run_simulation(brand, prompts, user_location, date.today())
     except Exception as e:
-        # Mark run as failed
-        supabase.table("daily_runs").update({
-            "status": "failed",
-            "completed_at": datetime.utcnow().isoformat(),
-            "error_message": str(e),
-        }).eq("id", run["id"]).execute()
         raise HTTPException(status_code=500, detail=f"Simulation failed: {e}")
+
+    return SimulateResponse(
+        run=summary,
+        message=f"Simulation complete: {summary.total_messages_analyzed} responses analyzed, {summary.target_brand_mentions} target brand mentions found.",
+    )
+
+
+@router.post("/api/simulate/backfill", response_model=BackfillResponse)
+async def simulate_backfill():
+    """Run simulations for the last 7 days using historical web search."""
+    brands = supabase.table("brand").select("*").execute().data
+    if not brands:
+        raise HTTPException(status_code=404, detail="No brand configured. POST /api/setup first.")
+    brand = brands[0]
+
+    prompts = (
+        supabase.table("prompts")
+        .select("*")
+        .eq("brand_id", brand["id"])
+        .eq("is_active", True)
+        .execute()
+        .data
+    )
+    if not prompts:
+        raise HTTPException(status_code=400, detail="No active prompts.")
+
+    user_location = None
+    if brand.get("country"):
+        user_location = {"type": "approximate", "country": brand["country"]}
+
+    today = date.today()
+    summaries: list[RunSummary] = []
+
+    try:
+        for days_ago in range(7, 0, -1):
+            run_date = today - timedelta(days=days_ago)
+            print(f"\n=== Backfill: starting simulation for {run_date} ===")
+            summary = await _run_simulation(
+                brand, prompts, user_location, run_date, historical=True,
+            )
+            summaries.append(summary)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Backfill failed on day {run_date}: {e}. {len(summaries)} days completed before failure.",
+        )
+
+    return BackfillResponse(
+        runs=summaries,
+        message=f"Backfill complete: {len(summaries)} daily simulations created.",
+    )
 
 
 @router.get("/api/conversations", response_model=ConversationsResponse)

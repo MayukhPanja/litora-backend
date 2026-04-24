@@ -73,6 +73,11 @@ class SimulateResponse(BaseModel):
     message: str
 
 
+class BackfillResponse(BaseModel):
+    runs: list[RunSummary]
+    message: str
+
+
 class CompetitorBreakdown(BaseModel):
     competitor_name: str
     appearance_count: int

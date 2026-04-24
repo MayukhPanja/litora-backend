@@ -20,7 +20,7 @@ async def _chat(messages: list[dict], temperature: float = 0.7,
     start = time.perf_counter()
 
     if web_search:
-        search_tool: dict = {"type": "web_search_preview"}
+        search_tool: dict = {"type": "web_search"}
         if user_location:
             search_tool["user_location"] = user_location
         print(f"_chat: web_search=True, search_tool={search_tool}")
@@ -75,14 +75,15 @@ async def _chat_historical(messages: list[dict], end_date: str,
     system_msg = {
         "role": "system",
         "content": (
-            f"Assume today's date is {end_date}. "
-            "Do not reference or use any information published after this date."
+            f"Today's date is {end_date}. "
+            "You must answer as if you are living on this date. "
+            "Ignore any search results, articles, or information published after this date. "
+            "If a search result is dated after this date, do not use it."
         ),
     }
     search_tool: dict = {
-        "type": "web_search_preview",
+        "type": "web_search",
         "search_context_size": "medium",
-        "filters": {"end_date": end_date},
     }
     if user_location:
         search_tool["user_location"] = user_location
@@ -105,6 +106,22 @@ async def _chat_historical(messages: list[dict], end_date: str,
     }
 
 
+def _build_response_row(run_id: str, prompt_id: str, result: dict) -> dict:
+    """Insert a responses row from a chat result and return it."""
+    row = {
+        "run_id": run_id,
+        "prompt_id": prompt_id,
+        "content": result["content"],
+    }
+    if result.get("model_used"):
+        row["model_used"] = result["model_used"]
+    if result.get("tokens_used") is not None:
+        row["tokens_used"] = result["tokens_used"]
+    if result.get("latency_ms") is not None:
+        row["latency_ms"] = result["latency_ms"]
+    return supabase.table("responses").insert(row).execute().data[0]
+
+
 async def run_conversation(run_id: str, prompt_id: str, question_text: str,
                            user_location: dict | None = None) -> dict:
     """Run a single prompt, store the response, and return the responses row."""
@@ -118,18 +135,24 @@ async def run_conversation(run_id: str, prompt_id: str, question_text: str,
         user_location=user_location,
     )
 
-    row = {
-        "run_id": run_id,
-        "prompt_id": prompt_id,
-        "content": result["content"],
-    }
-    if result.get("model_used"):
-        row["model_used"] = result["model_used"]
-    if result.get("tokens_used") is not None:
-        row["tokens_used"] = result["tokens_used"]
-    if result.get("latency_ms") is not None:
-        row["latency_ms"] = result["latency_ms"]
+    response_row = _build_response_row(run_id, prompt_id, result)
+    print(f"done\n")
+    return response_row
 
-    response_row = supabase.table("responses").insert(row).execute().data[0]
+
+async def run_conversation_historical(run_id: str, prompt_id: str, question_text: str,
+                                      end_date: str,
+                                      user_location: dict | None = None) -> dict:
+    """Like run_conversation but restricts web search to before end_date."""
+    print(f"\n--- run_conversation_historical (end_date={end_date}) ---")
+    print(f"question: {question_text[:80]}...")
+
+    result = await _chat_historical(
+        [{"role": "user", "content": question_text}],
+        end_date=end_date,
+        user_location=user_location,
+    )
+
+    response_row = _build_response_row(run_id, prompt_id, result)
     print(f"done\n")
     return response_row
